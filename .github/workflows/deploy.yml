@@ -1,0 +1,44 @@
+name: Deploy Azure AI Assistant
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18.x'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run linting
+      run: npm run lint || true
+
+    - name: Build
+      run: npm run build
+      env:
+        NEXT_PUBLIC_AZURE_CLIENT_ID: ${{ secrets.NEXT_PUBLIC_AZURE_CLIENT_ID }}
+        NEXT_PUBLIC_AZURE_TENANT_ID: ${{ secrets.NEXT_PUBLIC_AZURE_TENANT_ID }}
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_WORKSPACE_ID: ${{ secrets.AZURE_WORKSPACE_ID }}
+
+    - name: Deploy to Azure Web App
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: 'azure-ai-assistant'
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: . 

@@ -23,7 +23,6 @@ export default function ChatBox() {
         body: JSON.stringify({ query: input })
       })
       const data = await res.json()
-      
       setMessages(prev => [...prev, { 
         sender: MessageSender.ASSISTANT, 
         text: data.reply 
