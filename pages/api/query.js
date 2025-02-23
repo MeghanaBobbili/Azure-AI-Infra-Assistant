@@ -60,9 +60,12 @@ export default async function handler(req, res) {
       })
     }
   } catch (error) {
-    console.error("Azure Query Error:", error)
-    res.status(500).json({ 
-      reply: "Failed to connect to Azure Monitor. Please check your credentials and permissions." 
-    })
+    console.error("Azure Query Error Details:", {
+      message: error.message,
+      code: error.code,
+      stack: error.stack,
+      response: error.response ? error.response.data : null,
+    });
+    res.status(500).json({ reply: "Failed to connect to Azure Monitor." });
   }
 } 
