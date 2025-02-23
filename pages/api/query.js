@@ -1,4 +1,5 @@
-import { getAzureClient } from '../../src/lib/azure'
+import { DefaultAzureCredential } from "@azure/identity"
+import { LogsQueryClient } from "@azure/monitor-query"
 
 const mockAIResponse = (query) => {
   const q = query.toLowerCase()
@@ -25,29 +26,43 @@ export default async function handler(req, res) {
   }
 
   try {
-    // First try Azure Monitor query for real data
-    if (query.toLowerCase().includes('critical alerts')) {
-      const client = getAzureClient()
-      const result = await client.queryWorkspace(
-        process.env.AZURE_WORKSPACE_ID,
-        `AzureActivity 
-        | where ActivityStatus == 'Failed' 
-        | top 5 by TimeGenerated desc`,
-        { duration: 'P1D' }
-      )
-      return res.status(200).json({ 
-        reply: `Found ${result.status} critical alerts in the last 24 hours.`
+    const credential = new DefaultAzureCredential()
+    const client = new LogsQueryClient(credential)
+
+    // Test query to fetch recent failed activities
+    const result = await client.queryWorkspace(
+      process.env.AZURE_WORKSPACE_ID,
+      `AzureActivity 
+      | where ActivityStatus == 'Failed' 
+      | project TimeGenerated, ResourceGroup, ResourceProviderValue, OperationName, Properties
+      | top 5 by TimeGenerated desc`,
+      { duration: "P1D" }
+    )
+
+    if (result.tables?.[0]?.rows?.length > 0) {
+      const formattedResults = result.tables[0].rows.map(row => ({
+        time: new Date(row[0]).toLocaleString(),
+        resourceGroup: row[1],
+        provider: row[2],
+        operation: row[3],
+        details: row[4]
+      }))
+
+      res.status(200).json({ 
+        reply: "Recent failed activities:\n" + 
+          formattedResults.map(r => 
+            `• ${r.time}: ${r.operation} in ${r.resourceGroup}`
+          ).join("\n")
+      })
+    } else {
+      res.status(200).json({ 
+        reply: "Good news! No failed activities found in the last 24 hours." 
       })
     }
-
-    // Fall back to mock responses
-    const mockResponse = mockAIResponse(query)
-    res.status(200).json({ reply: mockResponse })
-
   } catch (error) {
-    console.error('Azure Query Error:', error)
+    console.error("Azure Query Error:", error)
     res.status(500).json({ 
-      reply: 'Failed to process query. Please try again later.'
+      reply: "Failed to connect to Azure Monitor. Please check your credentials and permissions." 
     })
   }
 } 
