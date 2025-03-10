@@ -15,246 +15,348 @@ import { OpenAIClient } from "@azure/openai"
 const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
 const apiKey = process.env.AZURE_OPENAI_API_KEY;
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ message: 'Method not allowed' })
+// Initialize Azure clients
+let credential, monitorClient, resourceClient, computeClient, webClient, costClient, logsClient;
+
+async function initializeClients() {
+  if (!credential) {
+    credential = new DefaultAzureCredential();
+    monitorClient = new MonitorClient(credential, process.env.AZURE_SUBSCRIPTION_ID);
+    resourceClient = new ResourceManagementClient(credential, process.env.AZURE_SUBSCRIPTION_ID);
+    computeClient = new ComputeManagementClient(credential, process.env.AZURE_SUBSCRIPTION_ID);
+    webClient = new WebSiteManagementClient(credential, process.env.AZURE_SUBSCRIPTION_ID);
+    costClient = new CostManagementClient(credential);
+    logsClient = new LogsQueryClient(credential);
+  }
+}
+
+async function getResourceMetrics(resource, timespan, interval = 'PT1H') {
+  const supportedTypes = [
+    'Microsoft.Compute/virtualMachines',
+    'Microsoft.Web/sites'
+  ];
+  
+  if (!supportedTypes.includes(resource.type)) {
+    return null;
   }
 
   try {
-    const { messages } = req.body
-    const userMessage = messages[messages.length - 1].content.toLowerCase()
-
-    // Initialize Azure clients
-    const credential = new DefaultAzureCredential()
-    const monitorClient = new MonitorClient(credential, process.env.AZURE_SUBSCRIPTION_ID)
-    const resourceClient = new ResourceManagementClient(credential, process.env.AZURE_SUBSCRIPTION_ID)
-
-    // Check if the query is about resource metrics
-    if (userMessage.includes('cpu') || userMessage.includes('memory') || userMessage.includes('performance')) {
-      // Get all resources
-      const resources = []
-      for await (const resource of resourceClient.resources.list()) {
-        resources.push(resource)
-      }
-
-      // Get metrics for the last 24 hours
-      const now = new Date()
-      const startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000)
-
-      const metricsData = []
-      for (const resource of resources) {
-        try {
-          const metrics = await monitorClient.metrics.list(
-            resource.id,
-            {
-              timespan: `${startTime.toISOString()}/${now.toISOString()}`,
-              interval: 'PT1H',
-              metricnames: 'Percentage CPU,Available Memory Bytes,Network In Total,Network Out Total'
-            }
-          )
-
-          if (metrics.value && metrics.value.length > 0) {
-            metricsData.push({
-              resourceName: resource.name,
-              resourceType: resource.type,
-              metrics: metrics.value.map(metric => ({
-                name: metric.name.value,
-                data: metric.timeseries[0]?.data.map(point => ({
-                  timestamp: point.timeStamp,
-                  value: point.average || 0
-                })) || []
-              }))
-            })
-          }
-        } catch (error) {
-          console.warn(`Could not fetch metrics for ${resource.name}:`, error.message)
-        }
-      }
-
-      // Format the metrics data for response
-      let metricsResponse = "Here are the current resource metrics:\n\n"
-      metricsData.forEach(resource => {
-        metricsResponse += `📊 ${resource.resourceName} (${resource.resourceType}):\n`
-        resource.metrics.forEach(metric => {
-          const latestValue = metric.data[metric.data.length - 1]?.value || 0
-          if (metric.name === 'Percentage CPU') {
-            metricsResponse += `- CPU Usage: ${latestValue.toFixed(2)}%\n`
-          } else if (metric.name === 'Available Memory Bytes') {
-            metricsResponse += `- Available Memory: ${(latestValue / 1024 / 1024 / 1024).toFixed(2)} GB\n`
-          } else if (metric.name.includes('Network')) {
-            metricsResponse += `- ${metric.name}: ${(latestValue / 1024 / 1024).toFixed(2)} MB/s\n`
-          }
-        })
-        metricsResponse += '\n'
-      })
-
-      // Add performance recommendations
-      metricsResponse += "\nRecommendations:\n"
-      metricsData.forEach(resource => {
-        const cpuMetric = resource.metrics.find(m => m.name === 'Percentage CPU')
-        if (cpuMetric) {
-          const avgCpu = cpuMetric.data.reduce((sum, point) => sum + point.value, 0) / cpuMetric.data.length
-          if (avgCpu > 80) {
-            metricsResponse += `⚠️ ${resource.resourceName} is experiencing high CPU usage. Consider scaling up or out.\n`
-          } else if (avgCpu < 20) {
-            metricsResponse += `💡 ${resource.resourceName} is underutilized. Consider scaling down to optimize costs.\n`
-          }
-        }
-      })
-
-      return res.status(200).json({
-        message: metricsResponse,
-        role: "assistant",
-        data: metricsData
-      })
-    }
-
-    // Check for scaling commands
-    if (userMessage.includes('scale down') || userMessage.includes('scale up')) {
-      const resources = []
-      for await (const resource of resourceClient.resources.list()) {
-        if (resource.type.includes('virtualMachines') || resource.type.includes('sites')) {
-          resources.push(resource)
-        }
-      }
-
-      // Get current metrics to make scaling recommendations
-      const metricsData = await Promise.all(resources.map(async (resource) => {
-        try {
-          const metrics = await monitorClient.metrics.list(
-            resource.id,
-            {
-              timespan: `${startTime.toISOString()}/${now.toISOString()}`,
-              interval: 'PT1H',
-              metricnames: 'Percentage CPU'
-            }
-          )
-
-          return {
-            resource,
-            metrics: metrics.value
-          }
-        } catch (error) {
-          console.warn(`Could not fetch metrics for ${resource.name}:`, error.message)
-          return { resource, metrics: [] }
-        }
-      }))
-
-      // Generate scaling recommendations
-      const recommendations = metricsData.map(({ resource, metrics }) => {
-        const cpuMetric = metrics.find(m => m.name.value === 'Percentage CPU')
-        const avgCpu = cpuMetric?.timeseries[0]?.data.reduce((sum, point) => sum + (point.average || 0), 0) / 
-          (cpuMetric?.timeseries[0]?.data.length || 1)
-
-        return {
-          resourceId: resource.id,
-          name: resource.name,
-          type: resource.type,
-          currentSize: resource.sku?.name || 'Unknown',
-          avgCpu: avgCpu || 0,
-          recommendation: avgCpu < 20 ? 'scale down' : avgCpu > 80 ? 'scale up' : 'no change'
-        }
-      })
-
-      return res.status(200).json({
-        message: `Here are the scaling recommendations based on current usage:\n\n${
-          recommendations.map(r => 
-            `📊 ${r.name} (${r.type}):\n` +
-            `- Current Size: ${r.currentSize}\n` +
-            `- Avg CPU: ${r.avgCpu.toFixed(1)}%\n` +
-            `- Recommendation: ${r.recommendation}\n`
-          ).join('\n')
-        }`,
-        role: "assistant",
-        data: recommendations,
-        requiresApproval: true,
-        action: 'scale'
-      })
-    }
-
-    // Enhanced system message with more Azure knowledge
-    const systemMessage = {
-      role: "system",
-      content: `You are an Azure Infrastructure Assistant, an expert in Azure cloud services and infrastructure management.
-
-Key Areas of Expertise:
-- Resource Management: Azure Resource Manager, resource groups, subscriptions, management groups
-- Compute: VMs, App Services, Container Instances, AKS, Functions
-- Networking: VNets, NSGs, Load Balancers, Application Gateway, ExpressRoute
-- Storage: Blob, Files, Disks, Data Lake
-- Security: Azure AD, Key Vault, Security Center, Sentinel
-- Monitoring: Monitor, Log Analytics, Application Insights
-- Cost Management: Budgets, Cost Analysis, Reserved Instances, Hybrid Benefits
-
-Response Guidelines:
-1. For implementation questions:
-   - Provide Azure CLI commands or Azure PowerShell scripts
-   - Include ARM template snippets when relevant
-   - Show Portal navigation steps
-   - Reference Bicep examples for IaC
-
-2. For architecture questions:
-   - Suggest Well-Architected Framework best practices
-   - Consider scalability, security, and cost optimization
-   - Provide relevant Azure architecture patterns
-   - Include service limits and quotas
-
-3. For troubleshooting:
-   - List common diagnostic steps
-   - Reference relevant Azure metrics and logs
-   - Suggest monitoring solutions
-   - Include links to troubleshooting guides
-
-4. Always include:
-   - Azure-specific terminology
-   - Service naming conventions
-   - Region considerations
-   - Cost implications
-   - Security best practices
-
-Format code blocks with appropriate syntax highlighting:
-- Azure CLI: \`\`\`bash
-- PowerShell: \`\`\`powershell
-- ARM/Bicep: \`\`\`json or \`\`\`bicep
-- YAML: \`\`\`yaml
-
-If unsure, ask for clarification about:
-- Azure environment context
-- Scale requirements
-- Compliance needs
-- Budget constraints`
-    }
-
-    // Regular chatbot response for non-metric queries
-    const response = await axios.post(
-      process.env.AZURE_OPENAI_ENDPOINT,
+    const metrics = await monitorClient.metrics.list(
+      resource.id,
       {
-        messages: [systemMessage, ...messages],
-        temperature: 0.7,
-        max_tokens: 1000,
-        top_p: 0.95,
-        frequency_penalty: 0,
-        presence_penalty: 0
+        timespan,
+        interval,
+        metricnames: resource.type === 'Microsoft.Compute/virtualMachines' 
+          ? 'Percentage CPU,Available Memory Bytes' 
+          : 'CpuPercentage,MemoryPercentage'
+      }
+    );
+
+    if (!metrics.value?.length) return null;
+
+    // Transform metrics into the expected format
+    const metricsData = {
+      resourceName: resource.name,
+      resourceType: resource.type,
+      metrics: {
+        cpu: {
+          current: metrics.value.find(m => 
+            m.name.value === (resource.type === 'Microsoft.Compute/virtualMachines' 
+              ? 'Percentage CPU' 
+              : 'CpuPercentage')
+          )?.timeseries[0]?.data.slice(-1)[0]?.average || 0,
+          history: metrics.value.find(m => 
+            m.name.value === (resource.type === 'Microsoft.Compute/virtualMachines' 
+              ? 'Percentage CPU' 
+              : 'CpuPercentage')
+          )?.timeseries[0]?.data.map(point => point.average || 0) || []
+        },
+        memory: {
+          current: metrics.value.find(m => 
+            m.name.value === (resource.type === 'Microsoft.Compute/virtualMachines' 
+              ? 'Available Memory Bytes' 
+              : 'MemoryPercentage')
+          )?.timeseries[0]?.data.slice(-1)[0]?.average || 0,
+          history: metrics.value.find(m => 
+            m.name.value === (resource.type === 'Microsoft.Compute/virtualMachines' 
+              ? 'Available Memory Bytes' 
+              : 'MemoryPercentage')
+          )?.timeseries[0]?.data.map(point => point.average || 0) || []
+        }
+      },
+      timestamps: metrics.value[0]?.timeseries[0]?.data.map(point => point.timeStamp) || []
+    };
+
+    return metricsData;
+  } catch (error) {
+    console.warn(`Could not fetch metrics for ${resource.name}:`, error.message);
+    return null;
+  }
+}
+
+async function getResourceCosts(scope) {
+  try {
+    const token = await credential.getToken("https://management.azure.com/.default");
+    
+    const today = new Date();
+    const startDate = new Date(today);
+    startDate.setDate(today.getDate() - 30);
+    
+    const startDateStr = startDate.toISOString().split('T')[0];
+    const endDateStr = today.toISOString().split('T')[0];
+    
+    const response = await axios.post(
+      `https://management.azure.com${scope}/providers/Microsoft.CostManagement/query`,
+      {
+        type: "ActualCost",
+        timeframe: "Custom",
+        timePeriod: {
+          from: `${startDateStr}T00:00:00Z`,
+          to: `${endDateStr}T23:59:59Z`
+        },
+        dataset: {
+          granularity: "None",
+          aggregation: {
+            totalCost: {
+              name: "Cost",
+              function: "Sum"
+            }
+          },
+          grouping: [
+            {
+              type: "Dimension",
+              name: "ServiceName"
+            }
+          ]
+        }
       },
       {
         headers: {
-          'Content-Type': 'application/json',
-          'api-key': process.env.AZURE_OPENAI_API_KEY
+          Authorization: `Bearer ${token.token}`,
+          "Content-Type": "application/json"
+        },
+        params: {
+          "api-version": "2023-08-01"
         }
       }
-    )
+    );
 
-    res.status(200).json({
-      message: response.data.choices[0].message.content,
-      role: "assistant"
-    })
+    // Debug logging
+    console.log('Cost API Response:', JSON.stringify(response.data, null, 2));
+
+    if (!response.data?.properties?.rows) {
+      console.log('No rows found in cost data');
+      return {
+        rows: [],
+        totalCost: 0,
+        dailyAverage: 0,
+        projectedCost: 0
+      };
+    }
+
+    const rows = response.data.properties.rows;
+    let total = 0;
+    const processedRows = rows.map(row => {
+      const serviceName = String(row[0] || "Unknown Service");
+      const cost = parseFloat(row[1] || 0);
+      
+      if (!isNaN(cost)) {
+        total += cost;
+      }
+      
+      return [serviceName, cost];
+    });
+
+    const dailyAvg = total / 30;
+    const projected = dailyAvg * 30;
+
+    return {
+      rows: processedRows,
+      totalCost: total,
+      dailyAverage: dailyAvg,
+      projectedCost: projected
+    };
+  } catch (error) {
+    console.error('Error fetching costs:', error.response?.data || error.message);
+    return {
+      rows: [],
+      totalCost: 0,
+      dailyAverage: 0,
+      projectedCost: 0,
+      error: error.message
+    };
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ message: 'Method not allowed' });
+  }
+
+  try {
+    await initializeClients();
+    
+    const { messages } = req.body;
+    const userMessage = messages[messages.length - 1].content.toLowerCase();
+    let azureData = null;
+    let errorDetails = null;
+
+    try {
+      // List all resources
+      if (userMessage.includes('list') && userMessage.includes('resource')) {
+        try {
+          const resources = [];
+          console.log('Fetching resources...');
+          
+          // Get all resource groups first
+          const resourceGroups = [];
+          for await (const group of resourceClient.resourceGroups.list()) {
+            resourceGroups.push(group.name);
+          }
+          console.log(`Found ${resourceGroups.length} resource groups`);
+          
+          // Get resources from each resource group
+          for (const groupName of resourceGroups) {
+            try {
+              for await (const resource of resourceClient.resources.listByResourceGroup(groupName)) {
+                resources.push({
+                  name: resource.name,
+                  type: resource.type,
+                  location: resource.location,
+                  resourceGroup: groupName,
+                  id: resource.id,
+                  tags: resource.tags || {},
+                  provisioningState: resource.provisioningState,
+                  createdTime: resource.createdTime
+                });
+              }
+            } catch (groupError) {
+              console.warn(`Error listing resources in group ${groupName}:`, groupError.message);
+            }
+          }
+          
+          console.log(`Found ${resources.length} total resources`);
+          
+          // Sort resources by type and name
+          resources.sort((a, b) => {
+            if (a.type === b.type) {
+              return a.name.localeCompare(b.name);
+            }
+            return a.type.localeCompare(b.type);
+          });
+          
+          azureData = {
+            type: 'resources',
+            data: resources,
+            count: resources.length,
+            resourceGroups: resourceGroups.length
+          };
+        } catch (resourceError) {
+          console.error('Error listing resources:', resourceError);
+          azureData = {
+            type: 'resources',
+            data: [],
+            count: 0,
+            error: resourceError.message
+          };
+        }
+      }
+      
+      // Cost data
+      else if (userMessage.includes('spending') || userMessage.includes('cost')) {
+        const scope = `/subscriptions/${process.env.AZURE_SUBSCRIPTION_ID}`;
+        const costData = await getResourceCosts(scope);
+        
+        azureData = {
+          type: 'costs',
+          data: {
+            total: costData.totalCost.toFixed(2),
+            projected: costData.projectedCost.toFixed(2),
+            byService: costData.rows.map(row => ({
+              name: row[0],
+              cost: row[1].toFixed(2),
+              percentage: costData.totalCost > 0 ? ((row[1] / costData.totalCost) * 100).toFixed(1) : "0"
+            }))
+          },
+          error: costData.error
+        };
+      }
+      
+      // CPU/Usage data
+      else if (userMessage.includes('cpu') || userMessage.includes('usage')) {
+        const resourceGroups = [];
+        for await (const group of resourceClient.resourceGroups.list()) {
+          resourceGroups.push(group.name);
+        }
+        
+        const vmsPromises = resourceGroups.map(group => 
+          computeClient.virtualMachines.list(group).catch(err => {
+            console.warn(`Error listing VMs in group ${group}:`, err.message);
+            return [];
+          })
+        );
+        
+        const vmLists = await Promise.all(vmsPromises);
+        const allVMs = vmLists.flat().filter(vm => vm && vm.id);
+        
+        if (allVMs.length === 0) {
+          azureData = {
+            type: 'metrics',
+            data: [],
+            message: 'No virtual machines found'
+          };
+        } else {
+          const timespan = 'PT24H';
+          const metricsPromises = allVMs.map(vm => 
+            getResourceMetrics(
+              { 
+                id: vm.id, 
+                name: vm.name, 
+                type: 'Microsoft.Compute/virtualMachines' 
+              }, 
+              timespan
+            ).catch(err => {
+              console.warn(`Error fetching metrics for ${vm.name}:`, err.message);
+              return null;
+            })
+          );
+          
+          const metricsResults = await Promise.all(metricsPromises);
+          const validMetrics = metricsResults.filter(m => m !== null);
+          
+          azureData = {
+            type: 'metrics',
+            data: validMetrics,
+            count: validMetrics.length
+          };
+        }
+      }
+      
+    } catch (dataError) {
+      console.error('Error fetching Azure data:', dataError);
+      errorDetails = dataError.message;
+    }
+
+    // Always return a valid response structure
+    return res.status(200).json({
+      message: messages[messages.length - 1].content,
+      azureData: azureData || { 
+        type: 'error',
+        error: true, 
+        message: errorDetails || 'No data available'
+      }
+    });
 
   } catch (error) {
-    console.error('Error processing query:', error)
-    res.status(200).json({
-      message: "I encountered an error fetching the data. Please try again in a moment.",
-      role: "assistant",
-      error: true
-    })
+    console.error('Handler error:', error);
+    return res.status(500).json({ 
+      message: 'Error processing request',
+      error: error.message,
+      azureData: {
+        type: 'error',
+        error: true,
+        message: error.message
+      }
+    });
   }
 } 

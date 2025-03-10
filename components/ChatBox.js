@@ -161,17 +161,52 @@ const ResourceMetrics = ({ resource }) => {
   )
 }
 
+const AlertCard = ({ alert }) => (
+  <div className={`p-4 rounded-lg border border-red-200 bg-red-50 mb-2`}>
+    <div className="flex items-center justify-between">
+      <div>
+        <h4 className="font-medium text-red-800">{alert.message}</h4>
+        <p className="text-sm text-red-600">
+          {new Date(alert.timestamp).toLocaleString()}
+        </p>
+      </div>
+      <span className="px-2 py-1 rounded text-sm font-medium bg-red-100 text-red-800">
+        {alert.severity}
+      </span>
+    </div>
+  </div>
+)
+
+const LogEntry = ({ log }) => (
+  <div className={`p-4 rounded-lg border border-yellow-200 bg-yellow-50 mb-2`}>
+    <div className="flex items-center justify-between">
+      <div>
+        <h4 className="font-medium text-yellow-800">{log.message}</h4>
+        <p className="text-sm text-yellow-600">
+          {new Date(log.timestamp).toLocaleString()}
+        </p>
+      </div>
+      <span className="px-2 py-1 rounded text-sm font-medium bg-yellow-100 text-yellow-800">
+        {log.level}
+      </span>
+    </div>
+  </div>
+)
+
 export default function ChatBox() {
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState([])
   const [isLoading, setIsLoading] = useState(false)
   const [isListening, setIsListening] = useState(false)
+  const [isTyping, setIsTyping] = useState(false)
+  const [selectedCategory, setSelectedCategory] = useState(null)
   const chartRefs = useRef({})
   const [pendingApproval, setPendingApproval] = useState(null)
   const [notification, setNotification] = useState(null)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const [metricsData, setMetricsData] = useState(null)
+  const [azureData, setAzureData] = useState(null)
 
   // Example questions for different categories
   const exampleQuestions = {
@@ -243,145 +278,190 @@ export default function ChatBox() {
   }
 
   const handleQuery = async (query) => {
-    setInput(query)
-    await handleSubmit()
-  }
+    try {
+      setIsLoading(true);
+      setIsTyping(true);
+      
+      const response = await fetch('/api/query', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [...messages, { role: 'user', content: query }]
+        })
+      });
 
-  // Add function to handle actions that require approval
+      const data = await response.json();
+      
+      // Add user message
+      setMessages(prev => [...prev, { 
+        role: 'user', 
+        content: query,
+        timestamp: new Date().toISOString()
+      }]);
+      
+      if (data.requiresApproval) {
+        setPendingApproval(data.action);
+        return;
+      }
+
+      // Add assistant message with Azure data
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: data.message,
+        azureData: data.azureData,
+        timestamp: new Date().toISOString()
+      }]);
+
+      // Update Azure data state if present
+      if (data.azureData) {
+        setAzureData(data.azureData);
+      }
+
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        error: true,
+        timestamp: new Date().toISOString()
+      }]);
+      setNotification({
+        type: 'error',
+        message: 'Failed to get response. Please try again.'
+      });
+    } finally {
+      setIsLoading(false);
+      setIsTyping(false);
+      scrollToBottom();
+    }
+  };
+
   const handleActionWithApproval = async (action) => {
-    setPendingApproval(action)
-    
     try {
-      if (action.type === 'scale') {
-        const scaleAction = await new Promise((resolve) => {
-          setPendingApproval({
-            title: 'Scale Resources',
-            message: 'Do you want to apply the recommended scaling changes?',
-            resources: action.data,
-            onApprove: () => resolve(true),
-            onDeny: () => resolve(false)
-          })
+      setIsLoading(true);
+      
+      const response = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          messages: [...messages],
+          action: action
         })
+      });
 
-        if (scaleAction) {
-          for (const resource of action.data) {
-            if (resource.recommendation !== 'no change') {
-              try {
-                const newSize = getNewSize(resource.currentSize, resource.recommendation)
-                await fetch('/api/resources/scale', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    resourceId: resource.resourceId,
-                    action: resource.recommendation,
-                    size: newSize
-                  })
-                })
-              } catch (error) {
-                console.error(`Failed to scale ${resource.name}:`, error)
-              }
-            }
-          }
+      const data = await response.json();
 
-          setNotification({
-            message: 'Scaling operations completed',
-            type: 'success'
-          })
-        }
-      } else {
-        // Normal query handling
-        const response = await fetch('/api/query', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: [...messages, { role: 'user', content: action.query }] })
-        })
-
-        const data = await response.json()
-        
-        // Handle metrics data if present
-        if (data.data) {
-          setMetricsData(data.data)
-        }
-
-        setMessages(prev => [...prev, { 
-          role: 'assistant', 
-          content: data.message,
-          metrics: data.data 
-        }])
-      }
-    } catch (error) {
-      console.error('Error querying assistant:', error)
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: 'I apologize, but I encountered an error. Please try rephrasing your question about Azure infrastructure.'
-      }])
-    } finally {
-      setIsLoading(false)
-    }
-  }
+        content: data.message,
+        azureData: data.azureData,
+        timestamp: new Date().toISOString()
+      }]);
 
-  // Modify handleSubmit to check for actions requiring approval
+      if (data.azureData) {
+        setAzureData(data.azureData);
+      }
+
+      setNotification({
+        type: 'success',
+        message: `Successfully executed ${action.type} operation`
+      });
+
+    } catch (error) {
+      console.error('Error executing action:', error);
+      setNotification({
+        type: 'error',
+        message: `Failed to execute ${action.type} operation`
+      });
+    } finally {
+      setPendingApproval(null);
+      setIsLoading(false);
+      scrollToBottom();
+    }
+  };
+
   const handleSubmit = async (e) => {
-    e.preventDefault()
-    if (!input.trim()) return
+    if (e) e.preventDefault();
+    if (!input.trim()) return;
 
-    const userMessage = { role: 'user', content: input }
-    setMessages(prev => [...prev, userMessage])
-    setInput('')
-    setIsLoading(true)
+    const query = input;
+    setInput('');
+    await handleQuery(query);
+  };
 
-    try {
-      // Check if action requires approval
-      if (input.toLowerCase().includes('restart') || 
-          input.toLowerCase().includes('scale') || 
-          input.toLowerCase().includes('delete')) {
-        
-        const result = await handleActionWithApproval({
-          query: input,
-          type: 'dangerous_action'
-        })
-
-        if (result) {
-          setMessages(prev => [...prev, { role: 'assistant', content: result.reply }])
-        }
-      } else {
-        // Normal query handling
-        const response = await fetch('/api/query', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: [...messages, userMessage] })
-        })
-
-        const data = await response.json()
-        
-        // Handle metrics data if present
-        if (data.data) {
-          setMetricsData(data.data)
-        }
-
-        setMessages(prev => [...prev, { 
-          role: 'assistant', 
-          content: data.message,
-          metrics: data.data 
-        }])
-      }
-    } catch (error) {
-      console.error('Error querying assistant:', error)
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: 'I apologize, but I encountered an error. Please try rephrasing your question about Azure infrastructure.'
-      }])
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSubmit(e)
-    }
-  }
+  const renderMessage = (message, index) => {
+    const isUser = message.role === 'user';
+    const hasAzureData = message.azureData && !message.azureData.error;
+    
+    return (
+      <div key={index} className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
+        <div className={`max-w-[80%] ${isUser ? 'bg-blue-500 text-white' : 'bg-gray-100'} rounded-lg px-4 py-2`}>
+          {/* Message content */}
+          <div className="whitespace-pre-line text-sm">
+            {message.content}
+          </div>
+          
+          {/* Azure Data Display */}
+          {hasAzureData && (
+            <div className="mt-3 pt-3 border-t border-gray-200">
+              {message.azureData.type === 'metrics' && (
+                <div className="space-y-4">
+                  {message.azureData.data.map((resource, i) => (
+                    <ResourceMetrics key={i} resource={resource} />
+                  ))}
+                </div>
+              )}
+              
+              {message.azureData.type === 'costs' && message.azureData.data && (
+                <div className="space-y-2">
+                  <div className="font-medium">Cost Summary</div>
+                  <div>Total: ${message.azureData.data.total}</div>
+                  <div>Projected: ${message.azureData.data.projected}</div>
+                  {message.azureData.data.byService && (
+                    <div className="mt-2">
+                      <div className="font-medium">Services:</div>
+                      <ul className="list-disc pl-5 mt-1">
+                        {message.azureData.data.byService.map((service, i) => (
+                          <li key={i}>
+                            {service.name}: ${service.cost} ({service.percentage}%)
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              {message.azureData.type === 'resources' && (
+                <div className="space-y-2">
+                  <div className="font-medium">Resources ({message.azureData.count})</div>
+                  <div className="max-h-60 overflow-y-auto">
+                    <ul className="list-disc pl-5">
+                      {message.azureData.data.map((resource, i) => (
+                        <li key={i} className="mb-2">
+                          <div>{resource.name}</div>
+                          <div className="text-xs text-gray-500">
+                            {resource.type} | {resource.location}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          
+          {/* Timestamp */}
+          <div className={`text-xs mt-1 ${isUser ? 'text-blue-200' : 'text-gray-500'}`}>
+            {new Date(message.timestamp).toLocaleTimeString()}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // Add function to render charts
   const renderChart = (chartConfig, messageId) => {
@@ -442,37 +522,39 @@ export default function ChatBox() {
     </div>
   )
 
-  // Update the renderMetricsChart function in ChatBox component
-  const renderMetricsChart = (metrics) => {
-    if (!metrics) return null
-    
-    return (
-      <div className="mt-4 space-y-6">
-        {metrics.map((resource, index) => (
-          <ResourceMetrics key={index} resource={resource} />
-        ))}
-      </div>
-    )
-  }
-
   return (
-    <div className="flex flex-col h-[600px] bg-white rounded-lg shadow">
-      {/* Messages Area */}
+    <div className="flex flex-col h-full">
+      {/* Chat header */}
+      <div className="bg-white border-b px-4 py-3 flex items-center justify-between">
+        <h2 className="text-lg font-semibold">Azure Assistant</h2>
+        <div className="flex items-center space-x-2">
+          {isListening && (
+            <span className="text-sm text-blue-500">Listening...</span>
+          )}
+          <button
+            onClick={() => setMessages([])}
+            className="text-gray-500 hover:text-gray-700"
+          >
+            Clear Chat
+          </button>
+        </div>
+      </div>
+
+      {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 ? (
-          <div className="text-center text-gray-500 mt-4">
-            <p className="font-medium">Welcome to Azure Infrastructure Assistant!</p>
-            <p className="mt-2">Ask me anything about:</p>
-            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="text-center text-gray-500 mt-8">
+            <p className="mb-4">How can I help you with Azure today?</p>
+            <div className="grid grid-cols-2 gap-4 max-w-2xl mx-auto">
               {Object.entries(exampleQuestions).map(([category, questions]) => (
-                <div key={category} className="bg-gray-50 p-4 rounded-lg">
-                  <h3 className="font-medium capitalize mb-2">{category}</h3>
+                <div key={category} className="bg-white p-4 rounded-lg shadow-sm">
+                  <h3 className="font-medium mb-2 capitalize">{category}</h3>
                   <ul className="space-y-2">
                     {questions.map((q, i) => (
                       <li key={i}>
                         <button
                           onClick={() => handleQuery(q)}
-                          className="text-left text-blue-600 hover:text-blue-800 text-sm"
+                          className="text-sm text-left text-blue-500 hover:text-blue-700"
                         >
                           {q}
                         </button>
@@ -484,117 +566,64 @@ export default function ChatBox() {
             </div>
           </div>
         ) : (
-          messages.map((message, index) => (
-            <div
-              key={index}
-              className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-lg p-4 ${
-                  message.role === 'user'
-                    ? 'bg-blue-500 text-white'
-                    : 'bg-white border border-gray-200 shadow-sm text-gray-800'
-                }`}
-              >
-                <div className="prose prose-sm max-w-none space-y-4">
-                  {message.content.split('```').map((part, i) => {
-                    if (i % 2 === 0) {
-                      return (
-                        <div 
-                          key={i} 
-                          className="whitespace-pre-wrap leading-relaxed"
-                          style={{ fontSize: '15px' }}
-                        >
-                          {part}
-                        </div>
-                      )
-                    } else {
-                      const [lang, ...code] = part.split('\n')
-                      return (
-                        <div key={i} className="relative group">
-                          <pre className={`language-${lang} rounded-lg bg-gray-800 p-4 my-2`}>
-                            <code className="text-gray-100 text-sm font-mono">{code.join('\n')}</code>
-                          </pre>
-                          <button
-                            onClick={() => navigator.clipboard.writeText(code.join('\n'))}
-                            className="absolute top-2 right-2 bg-gray-700 text-gray-300 px-3 py-1 rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex items-center space-x-1"
-                          >
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                            </svg>
-                            <span>Copy</span>
-                          </button>
-                        </div>
-                      )
-                    }
-                  })}
-                </div>
-                {message.metrics && (
-                  <div className="mt-4 pt-4 border-t border-gray-200">
-                    {renderMetricsChart(message.metrics)}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))
+          messages.map((message, index) => renderMessage(message, index))
         )}
-        {isLoading && (
-          <div className="flex justify-start">
-            <div className="bg-gray-100 rounded-lg p-4 max-w-[80%]">
-              <div className="flex space-x-2">
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" />
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} />
-              </div>
-            </div>
+        {isTyping && (
+          <div className="flex items-center space-x-2 text-gray-500">
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" />
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-100" />
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-200" />
           </div>
         )}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input Area */}
-      <form onSubmit={handleSubmit} className="p-4 border-t">
-        <div className="flex space-x-4">
-          <textarea
+      {/* Input area */}
+      <div className="border-t bg-white p-4">
+        <form onSubmit={handleSubmit} className="flex space-x-4">
+          <input
             ref={inputRef}
+            type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyPress={handleKeyPress}
-            placeholder="Ask about Azure infrastructure..."
-            className="flex-1 border rounded-lg p-2 resize-none"
-            rows="2"
+            placeholder="Ask me anything about Azure..."
+            className="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
             disabled={isLoading}
           />
           <button
             type="submit"
             disabled={isLoading || !input.trim()}
-            className={`px-4 py-2 rounded-lg ${
-              isLoading || !input.trim()
-                ? 'bg-gray-300 cursor-not-allowed'
-                : 'bg-blue-500 hover:bg-blue-600 text-white'
-            }`}
+            className="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 disabled:bg-blue-300"
           >
-            Send
+            {isLoading ? 'Sending...' : 'Send'}
           </button>
-        </div>
-      </form>
+          <button
+            type="button"
+            onClick={handleVoiceInput}
+            className={`p-2 rounded-lg ${isListening ? 'bg-red-500 text-white' : 'bg-gray-100 text-gray-600'}`}
+          >
+            🎤
+          </button>
+        </form>
+      </div>
 
+      {/* Approval Dialog */}
       {pendingApproval && (
         <ApprovalDialog
           action={pendingApproval}
-          onApprove={pendingApproval.onApprove}
-          onDeny={pendingApproval.onDeny}
+          onApprove={handleActionWithApproval}
+          onCancel={() => setPendingApproval(null)}
         />
       )}
 
+      {/* Notification Toast */}
       {notification && (
         <NotificationToast
-          {...notification}
+          message={notification.message}
+          type={notification.type}
           onClose={() => setNotification(null)}
         />
       )}
-
-      {metricsData && renderMetricsChart(metricsData)}
     </div>
   )
 } 

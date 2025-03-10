@@ -1,5 +1,4 @@
 import { DefaultAzureCredential } from "@azure/identity"
-import { ResourceHealthClient } from "@azure/arm-resourcehealth"
 import { MonitorClient } from "@azure/arm-monitor"
 
 export default async function handler(req, res) {
@@ -7,77 +6,78 @@ export default async function handler(req, res) {
     return res.status(405).json({ message: 'Method not allowed' })
   }
 
-  const { resource = 'all' } = req.query
-
   try {
     const credential = new DefaultAzureCredential()
-    const healthClient = new ResourceHealthClient(credential, process.env.AZURE_SUBSCRIPTION_ID)
-    const monitorClient = new MonitorClient(credential, process.env.AZURE_SUBSCRIPTION_ID)
+    const subscriptionId = process.env.AZURE_SUBSCRIPTION_ID
+    const monitorClient = new MonitorClient(credential, subscriptionId)
 
-    // Get resource health
-    const scope = `/subscriptions/${process.env.AZURE_SUBSCRIPTION_ID}`
-    let healthData = []
-
-    try {
-      const healthResults = await healthClient.availabilityStatuses.listBySubscriptionId()
-      for await (const status of healthResults) {
-        healthData.push({
-          id: status.id,
-          name: status.name,
-          type: status.type,
-          status: status.properties.availabilityState,
-          reason: status.properties.reasonType,
-          description: status.properties.summary,
-          lastUpdated: status.properties.occuredTime
-        })
-      }
-    } catch (error) {
-      console.warn('Health data not available:', error.message)
-    }
-
-    // Get performance metrics
+    // Get resource health using Monitor client instead
     const now = new Date()
     const startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000) // Last 24 hours
 
     const metrics = await monitorClient.metrics.list(
-      scope,
+      process.env.RESOURCE_ID,
       {
         timespan: `${startTime.toISOString()}/${now.toISOString()}`,
         interval: 'PT1H',
-        metricnames: ['Percentage CPU', 'Available Memory Bytes', 'Network In Total'].join(',')
+        metricnames: 'Percentage CPU,Available Memory Bytes,Network In Total,Network Out Total'
       }
     )
 
-    // Process metrics
-    const processedMetrics = metrics.value.map(metric => ({
-      name: metric.name.value,
-      data: metric.timeseries[0]?.data.map(point => ({
-        timestamp: point.timeStamp,
-        value: point.average || 0
-      })) || []
-    }))
+    // Transform metrics into health status
+    const resources = []
+    if (metrics.value) {
+      const cpuMetric = metrics.value.find(m => m.name.value === 'Percentage CPU')
+      const memoryMetric = metrics.value.find(m => m.name.value === 'Available Memory Bytes')
+      const networkInMetric = metrics.value.find(m => m.name.value === 'Network In Total')
+      const networkOutMetric = metrics.value.find(m => m.name.value === 'Network Out Total')
 
-    res.status(200).json({
-      health: healthData,
+      const getLatestValue = (metric) => {
+        if (!metric?.timeseries?.[0]?.data) return null
+        const data = metric.timeseries[0].data
+        return data[data.length - 1]?.average || null
+      }
+
+      const cpuValue = getLatestValue(cpuMetric)
+      const memoryValue = getLatestValue(memoryMetric)
+      const networkIn = getLatestValue(networkInMetric)
+      const networkOut = getLatestValue(networkOutMetric)
+
+      resources.push({
+        id: process.env.RESOURCE_ID,
+        name: process.env.RESOURCE_ID.split('/').pop(),
+        type: 'Virtual Machine',
+        status: cpuValue > 80 ? 'critical' : cpuValue > 60 ? 'warning' : 'healthy',
+        metrics: {
+          cpu: cpuValue?.toFixed(1) || '0',
+          memory: memoryValue ? ((memoryValue / 1024 / 1024 / 1024).toFixed(1) + ' GB') : '0 GB',
+          network: {
+            in: networkIn ? ((networkIn / 1024 / 1024).toFixed(1) + ' MB/s') : '0 MB/s',
+            out: networkOut ? ((networkOut / 1024 / 1024).toFixed(1) + ' MB/s') : '0 MB/s'
+          }
+        }
+      })
+    }
+
+    return res.status(200).json({
+      resources,
       metrics: {
-        cpu: processedMetrics.find(m => m.name === 'Percentage CPU')?.data || [],
-        memory: processedMetrics.find(m => m.name === 'Available Memory Bytes')?.data || [],
-        network: processedMetrics.find(m => m.name === 'Network In Total')?.data || []
-      },
-      timestamp: now.toISOString()
+        labels: metrics.value?.[0]?.timeseries?.[0]?.data?.map(d => 
+          new Date(d.timeStamp).toLocaleTimeString()
+        ) || [],
+        datasets: metrics.value?.map(metric => ({
+          id: metric.name.value,
+          label: metric.name.value,
+          data: metric.timeseries?.[0]?.data?.map(d => d.average) || []
+        })) || [],
+        title: 'Resource Performance',
+        yAxisLabel: 'Usage',
+        xAxisLabel: 'Time'
+      }
     })
 
   } catch (error) {
     console.error('Error fetching health data:', error)
-    res.status(200).json({
-      health: [],
-      metrics: {
-        cpu: [],
-        memory: [],
-        network: []
-      },
-      error: 'Failed to fetch health data. Please verify Azure permissions.',
-      timestamp: new Date().toISOString()
-    })
+    return res.status(500).json({ message: 'Failed to fetch health data' })
   }
 } 

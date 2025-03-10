@@ -1,18 +1,18 @@
 {
-  "components\\ChatBox.js -> chart.js/auto": {
-    "id": "components\\ChatBox.js -> chart.js/auto",
+  "..\\components\\ChatBox.js -> chart.js/auto": {
+    "id": "..\\components\\ChatBox.js -> chart.js/auto",
     "files": [
       "static/chunks/node_modules_chart_js_auto_auto_js.js"
     ]
   },
-  "components\\MetricsChart.js -> chart.js/auto": {
-    "id": "components\\MetricsChart.js -> chart.js/auto",
+  "..\\components\\MetricsChart.js -> chart.js/auto": {
+    "id": "..\\components\\MetricsChart.js -> chart.js/auto",
     "files": [
       "static/chunks/node_modules_chart_js_auto_auto_js.js"
     ]
   },
-  "node_modules\\@azure\\msal-browser\\dist\\telemetry\\BrowserPerformanceClient.mjs -> ./BrowserPerformanceMeasurement.mjs": {
-    "id": "node_modules\\@azure\\msal-browser\\dist\\telemetry\\BrowserPerformanceClient.mjs -> ./BrowserPerformanceMeasurement.mjs",
+  "..\\node_modules\\@azure\\msal-browser\\dist\\telemetry\\BrowserPerformanceClient.mjs -> ./BrowserPerformanceMeasurement.mjs": {
+    "id": "..\\node_modules\\@azure\\msal-browser\\dist\\telemetry\\BrowserPerformanceClient.mjs -> ./BrowserPerformanceMeasurement.mjs",
     "files": []
   }
 }

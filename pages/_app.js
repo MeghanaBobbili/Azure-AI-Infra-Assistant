@@ -1,5 +1,6 @@
 import { PublicClientApplication } from '@azure/msal-browser'
 import { MsalProvider } from '@azure/msal-react'
+import { SessionProvider } from 'next-auth/react'
 import '../styles/globals.css'
 
 const msalConfig = {
@@ -18,9 +19,11 @@ const msalInstance = new PublicClientApplication(msalConfig)
 
 function MyApp({ Component, pageProps }) {
   return (
-    <MsalProvider instance={msalInstance}>
-      <Component {...pageProps} />
-    </MsalProvider>
+    <SessionProvider session={pageProps.session}>
+      <MsalProvider instance={msalInstance}>
+        <Component {...pageProps} />
+      </MsalProvider>
+    </SessionProvider>
   )
 }
 

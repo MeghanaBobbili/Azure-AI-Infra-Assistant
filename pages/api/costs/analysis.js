@@ -1,5 +1,5 @@
-import { DefaultAzureCredential } from "@azure/identity"
-import { CostManagementClient } from "@azure/arm-costmanagement"
+import { getServerSession } from "next-auth/next"
+import { authOptions } from "../auth/[...nextauth]"
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -7,121 +7,144 @@ export default async function handler(req, res) {
   }
 
   try {
-    const credential = new DefaultAzureCredential()
-    const client = new CostManagementClient(credential, process.env.AZURE_SUBSCRIPTION_ID)
-
-    // Simpler query for testing
-    const queryParams = {
-      type: 'ActualCost',
-      timeframe: 'MonthToDate',
-      dataset: {
-        granularity: 'Daily',
-        aggregation: {
-          totalCost: {
-            name: 'Cost',
-            function: 'Sum'
-          }
-        }
-      }
+    const session = await getServerSession(req, res, authOptions)
+    if (!session) {
+      return res.status(401).json({ message: 'Unauthorized' })
     }
 
-    const scope = `/subscriptions/${process.env.AZURE_SUBSCRIPTION_ID}`
+    const { accessToken, subscriptionId } = session
     
-    try {
-      console.log('Fetching cost data...')
-      const result = await client.query.usage(scope, queryParams)
-      console.log('Cost data result:', JSON.stringify(result, null, 2))
-
-      if (!result.rows || result.rows.length === 0) {
-        console.log('No cost data found')
-        return res.status(200).json({
-          costs: [],
-          total: 0,
-          message: "No cost data available yet. This could be because:\n" +
-            "• Your subscription is new or free tier\n" +
-            "• No billable resources have been deployed\n" +
-            "• Cost data takes 24-48 hours to appear\n" +
-            "• The current billing period hasn't closed"
-        })
-      }
-
-      // Basic data processing with proper date formatting
-      const costs = result.rows.map(row => {
-        // Parse YYYYMMDD format from Azure
-        const dateNum = row[1].toString()
-        const year = parseInt(dateNum.slice(0, 4))
-        const month = parseInt(dateNum.slice(4, 6)) - 1 // Months are 0-based
-        const day = parseInt(dateNum.slice(6, 8))
-        
-        const date = new Date(year, month, day)
-
-        return {
-          cost: parseFloat(row[0] || 0),
-          date: date.toISOString().split('T')[0],
-          currency: row[2] || 'USD'
-        }
-      }).sort((a, b) => new Date(a.date) - new Date(b.date))
-
-      const total = costs.reduce((sum, item) => sum + item.cost, 0)
-      const avgDailyCost = total / costs.length
-
-      // Use the actual dates from the cost data
-      const startDate = new Date(costs[0].date)
-      const endDate = new Date(costs[costs.length - 1].date)
-
-      // Calculate top resources (in this case, by date since we don't have resource info)
-      const topResources = costs.map(cost => ({
-        name: new Date(cost.date).toLocaleDateString(),
-        type: 'Daily Usage',
-        cost: cost.cost,
-        percentage: ((cost.cost / total) * 100).toFixed(1)
-      })).sort((a, b) => b.cost - a.cost)
-
-      return res.status(200).json({
-        daily: {
-          dates: costs.map(c => {
-            const d = new Date(c.date)
-            return d.toLocaleDateString('en-US', { 
-              month: 'short', 
-              day: 'numeric',
-            })
-          }),
-          costs: costs.map(c => c.cost),
-          average: avgDailyCost
-        },
-        monthly: {
-          total: total,
-          trend: 0
-        },
-        forecast: {
-          total: avgDailyCost * 30,
-          budget: avgDailyCost * 30 * 1.2
-        },
-        costs,
-        topResources,
-        total: total.toFixed(6),
-        currency: costs[0]?.currency || 'USD',
-        startDate: startDate.toISOString().split('T')[0],
-        endDate: endDate.toISOString().split('T')[0]
-      })
-
-    } catch (queryError) {
-      console.error('Error querying cost data:', queryError)
-      return res.status(200).json({
-        costs: [],
-        total: 0,
-        message: `Cost data query failed: ${queryError.message}`,
-        error: queryError.message
+    if (!subscriptionId) {
+      return res.status(400).json({ 
+        message: 'No subscription ID found in session. Please ensure you have access to an Azure subscription.'
       })
     }
+
+    // Get current date and start of month
+    const endDate = new Date()
+    const startDate = new Date(endDate.getFullYear(), endDate.getMonth(), 1)
+
+    // Get usage details directly from Azure Management API
+    const usageDetails = []
+    try {
+      const url = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.CostManagement/query?api-version=2021-10-01`
+      console.log('Calling Azure API:', url)
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          type: 'ActualCost',
+          timeframe: 'Custom',
+          timePeriod: {
+            from: startDate.toISOString(),
+            to: endDate.toISOString()
+          },
+          dataSet: {
+            granularity: 'Daily',
+            aggregation: {
+              totalCost: {
+                name: 'Cost',
+                function: 'Sum'
+              }
+            },
+            grouping: [
+              {
+                type: 'Dimension',
+                name: 'ResourceGroupName'
+              },
+              {
+                type: 'Dimension',
+                name: 'ResourceType'
+              }
+            ]
+          }
+        })
+      })
+
+      console.log('Response status:', response.status)
+      const responseText = await response.text()
+      console.log('Response body:', responseText)
+
+      if (!response.ok) {
+        throw new Error(`API Error: ${response.status} - ${responseText}`)
+      }
+
+      const data = JSON.parse(responseText)
+      console.log('Columns:', JSON.stringify(data.properties.columns, null, 2))
+      console.log('Rows:', JSON.stringify(data.properties.rows, null, 2))
+      
+      // Transform cost management data into our format
+      for (const row of data.properties?.rows || []) {
+        console.log('Processing row:', row)
+        const [cost, dateNum, resourceGroup, resourceType, currency] = row
+        
+        // Parse YYYYMMDD format
+        const year = Math.floor(dateNum / 10000)
+        const month = Math.floor((dateNum % 10000) / 100) - 1 // JS months are 0-based
+        const day = dateNum % 100
+        const date = new Date(year, month, day)
+        
+        const item = {
+          date: date.toISOString(),
+          resourceGroup: resourceGroup || 'Unassigned',
+          resourceType: resourceType || 'Other',
+          cost: Number(cost) || 0,
+          currency: currency || 'USD'
+        }
+        console.log('Transformed item:', item)
+        usageDetails.push(item)
+      }
+
+      console.log('Total items:', usageDetails.length)
+    } catch (error) {
+      console.error('Error fetching usage details:', error)
+      console.error('Access Token:', accessToken)
+      throw error
+    }
+
+    // Calculate totals and daily averages
+    const total = usageDetails.reduce((sum, item) => sum + (Number(item.cost) || 0), 0)
+    const dailyAverage = total / ((endDate - startDate) / (1000 * 60 * 60 * 24))
+
+    // Group by resource group
+    const costByResourceGroup = usageDetails.reduce((acc, item) => {
+      const rg = item.resourceGroup || 'Unassigned'
+      acc[rg] = (acc[rg] || 0) + (Number(item.cost) || 0)
+      return acc
+    }, {})
+
+    // Group by resource type
+    const costByServiceType = usageDetails.reduce((acc, item) => {
+      const type = item.resourceType || 'Other'
+      acc[type] = (acc[type] || 0) + (Number(item.cost) || 0)
+      return acc
+    }, {})
+
+    // Calculate forecast based on daily average
+    const daysInMonth = new Date(endDate.getFullYear(), endDate.getMonth() + 1, 0).getDate()
+    const forecastTotal = dailyAverage * daysInMonth
+
+    return res.status(200).json({
+      total: total.toFixed(2),
+      dailyAverage: dailyAverage.toFixed(2),
+      forecastTotal: forecastTotal.toFixed(2),
+      currency: usageDetails[0]?.currency || 'USD',
+      costByResourceGroup,
+      costByServiceType,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      usageDetails: usageDetails.slice(0, 100) // Limit to last 100 entries
+    })
 
   } catch (error) {
-    console.error('Error initializing cost client:', error)
-    return res.status(200).json({
-      costs: [],
-      total: 0,
-      message: "Unable to access cost data. Please verify Azure permissions.",
-      error: error.message
+    console.error('Error fetching cost data:', error)
+    return res.status(500).json({ 
+      message: 'Failed to fetch cost data',
+      error: error.message 
     })
   }
 } 

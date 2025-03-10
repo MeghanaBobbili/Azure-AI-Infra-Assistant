@@ -40,7 +40,7 @@ export default function CostAnalysisDashboard() {
     return <div className="text-red-500 text-center py-4">{error}</div>
   }
 
-  if (!costData?.costs?.length || costData?.message) {
+  if (!costData || !costData.total) {
     return (
       <div className="bg-white rounded-lg shadow p-6">
         <div className="flex justify-between items-center mb-6">
@@ -142,7 +142,7 @@ export default function CostAnalysisDashboard() {
         <div className="bg-green-50 rounded-lg p-4">
           <h3 className="text-sm font-medium text-green-800">Daily Average</h3>
           <p className="text-2xl font-bold text-green-900 mt-1">
-            {formatCost(costData.daily.average)}
+            {formatCost(parseFloat(costData.dailyAverage))} {costData.currency}
           </p>
           <p className="text-sm text-green-700 mt-1">
             Per day this period
@@ -152,7 +152,7 @@ export default function CostAnalysisDashboard() {
         <div className="bg-purple-50 rounded-lg p-4">
           <h3 className="text-sm font-medium text-purple-800">Projected Monthly</h3>
           <p className="text-2xl font-bold text-purple-900 mt-1">
-            {formatCost(costData.forecast.total)}
+            {formatCost(parseFloat(costData.forecastTotal))} {costData.currency}
           </p>
           <p className="text-sm text-purple-700 mt-1">
             Based on current usage
@@ -160,16 +160,43 @@ export default function CostAnalysisDashboard() {
         </div>
       </div>
 
-      {costData.daily.dates.length > 0 && (
+      <div className="mt-6">
+        <h3 className="text-lg font-medium mb-4">Cost by Resource Type</h3>
+        <div className="space-y-3">
+          {Object.entries(costData.costByServiceType).map(([type, cost], index) => (
+            <div key={index} className="border rounded-lg p-4">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h4 className="font-medium">{type}</h4>
+                </div>
+                <div className="text-right">
+                  <p className="font-medium">{formatCost(cost)} {costData.currency}</p>
+                  <p className="text-sm text-gray-600">
+                    {((cost / parseFloat(costData.total)) * 100).toFixed(1)}%
+                  </p>
+                </div>
+              </div>
+              <div className="mt-2 w-full bg-gray-200 rounded-full h-2">
+                <div 
+                  className="bg-blue-600 h-2 rounded-full" 
+                  style={{ width: `${(cost / parseFloat(costData.total)) * 100}%` }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {costData.usageDetails.length > 0 && (
         <div className="mt-6 bg-white p-4 rounded-lg border">
           <h3 className="text-lg font-medium mb-4">Daily Cost Trend</h3>
           <MetricsChart 
             data={{
-              labels: costData.daily.dates,
+              labels: costData.usageDetails.map(item => new Date(item.date).toLocaleDateString()),
               datasets: [{
                 id: 'daily-cost',
                 label: 'Daily Cost',
-                data: costData.daily.costs,
+                data: costData.usageDetails.map(item => item.cost),
                 borderColor: '#3B82F6',
                 backgroundColor: 'rgba(59, 130, 246, 0.1)',
                 fill: true,
@@ -194,7 +221,7 @@ export default function CostAnalysisDashboard() {
                 tooltip: {
                   callbacks: {
                     label: (context) => {
-                      return `Cost: ${formatCost(context.raw)}`
+                      return `Cost: ${formatCost(context.raw)} ${costData.currency}`
                     }
                   }
                 }
@@ -226,7 +253,7 @@ export default function CostAnalysisDashboard() {
             }}
           />
           <div className="mt-2 text-sm text-gray-500 text-center">
-            Showing cost trends from {costData.startDate} to {costData.endDate}
+            Showing cost trends from {new Date(costData.startDate).toLocaleDateString()} to {new Date(costData.endDate).toLocaleDateString()}
           </div>
         </div>
       )}
