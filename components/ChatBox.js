@@ -5,6 +5,7 @@ import NotificationToast from './NotificationToast'
 import MetricsChart from './MetricsChart'
 import { Line, Bar } from 'react-chartjs-2'
 import { FiCpu, FiHardDrive, FiWifi, FiAlertTriangle, FiCheckCircle } from 'react-icons/fi'
+import { processQuery } from '../src/utils/queryParser'
 
 let Chart;
 if (typeof window !== 'undefined') {
@@ -282,24 +283,33 @@ export default function ChatBox() {
       setIsLoading(true);
       setIsTyping(true);
       
-      const response = await fetch('/api/query', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messages: [...messages, { role: 'user', content: query }]
-        })
-      });
-
-      const data = await response.json();
+      // Process query through our parsing layer
+      const processedQuery = await processQuery(query, messages);
       
+      if (!processedQuery.success) {
+        throw new Error(processedQuery.error);
+      }
+
       // Add user message
       setMessages(prev => [...prev, { 
         role: 'user', 
         content: query,
         timestamp: new Date().toISOString()
       }]);
+
+      const response = await fetch('/api/query', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [...messages, { role: 'user', content: query }],
+          intent: processedQuery.intent,
+          refinedPrompt: processedQuery.refinedPrompt
+        })
+      });
+
+      const data = await response.json();
       
       if (data.requiresApproval) {
         setPendingApproval(data.action);
@@ -311,6 +321,7 @@ export default function ChatBox() {
         role: 'assistant',
         content: data.message,
         azureData: data.azureData,
+        intent: processedQuery.intent,
         timestamp: new Date().toISOString()
       }]);
 

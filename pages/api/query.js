@@ -9,14 +9,19 @@ import axios from 'axios'
 import { Chart } from 'chart.js/auto'
 import * as armResourceHealth from "@azure/arm-resourcehealth"
 import { SecurityCenter } from "@azure/arm-security"
-import { OpenAIClient } from "@azure/openai"
-
-// Initialize the OpenAI Client
-const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-const apiKey = process.env.AZURE_OPENAI_API_KEY;
+import { getAzureData } from '../../src/utils/azure'
+import rateLimit from 'express-rate-limit'
+import { trackApiCall, generateCorrelationId, recordMetric } from '../../src/utils/telemetry'
+import { detectIntent, refinePrompt, processWithOpenAI, INTENTS } from '../../src/utils/queryParser'
 
 // Initialize Azure clients
 let credential, monitorClient, resourceClient, computeClient, webClient, costClient, logsClient;
+
+// Rate limiting setup
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
 
 async function initializeClients() {
   if (!credential) {
@@ -188,175 +193,234 @@ async function getResourceCosts(scope) {
   }
 }
 
+async function callWithRetry(fn, maxRetries = 3, initialDelay = 1000) {
+  let lastError;
+  let delay = initialDelay;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      // Check if it's a rate limit error
+      if (error.response?.data?.error?.code === '429') {
+        // Get retry delay from error message or use exponential backoff
+        const retryAfter = parseInt(error.response.headers['retry-after']) || (delay / 1000);
+        console.log(`Rate limited. Retrying after ${retryAfter} seconds...`);
+        
+        // Wait for the specified time
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        
+        // Increase delay for next potential retry
+        delay *= 2;
+        continue;
+      }
+      
+      // If it's not a rate limit error, throw immediately
+      throw error;
+    }
+  }
+  
+  throw lastError;
+}
+
+// Request validation
+function validateRequest(req) {
+  const { messages, intent, action } = req.body;
+  
+  if (!messages || !Array.isArray(messages)) {
+    throw new Error('Invalid messages format');
+  }
+  
+  if (action && !['scale', 'restart', 'stop', 'start'].includes(action.type)) {
+    throw new Error('Invalid action type');
+  }
+  
+  return true;
+}
+
 export default async function handler(req, res) {
+  const correlationId = generateCorrelationId();
+  const startTime = Date.now();
+
+  // Add correlation ID to response headers
+  res.setHeader('X-Correlation-ID', correlationId);
+
+  // Apply rate limiting
+  try {
+    await new Promise((resolve, reject) => {
+      limiter(req, res, (result) => {
+        if (result instanceof Error) reject(result);
+        resolve(result);
+      });
+    });
+  } catch (error) {
+    recordMetric('rate_limit_exceeded', 1, { correlationId });
+    return res.status(429).json({
+      error: 'Too many requests',
+      retryAfter: Math.ceil(error.resetTime / 1000),
+      correlationId
+    });
+  }
+
   if (req.method !== 'POST') {
-    return res.status(405).json({ message: 'Method not allowed' });
+    recordMetric('invalid_method', 1, { correlationId, method: req.method });
+    return res.status(405).json({ error: 'Method not allowed', correlationId });
   }
 
   try {
-    await initializeClients();
+    // Validate request
+    validateRequest(req);
     
-    const { messages } = req.body;
-    const userMessage = messages[messages.length - 1].content.toLowerCase();
-    let azureData = null;
-    let errorDetails = null;
+    await initializeClients();
+    const { messages, query } = req.body;
 
-    try {
-      // List all resources
-      if (userMessage.includes('list') && userMessage.includes('resource')) {
-        try {
-          const resources = [];
-          console.log('Fetching resources...');
-          
-          // Get all resource groups first
-          const resourceGroups = [];
-          for await (const group of resourceClient.resourceGroups.list()) {
-            resourceGroups.push(group.name);
-          }
-          console.log(`Found ${resourceGroups.length} resource groups`);
-          
-          // Get resources from each resource group
-          for (const groupName of resourceGroups) {
-            try {
-              for await (const resource of resourceClient.resources.listByResourceGroup(groupName)) {
-                resources.push({
-                  name: resource.name,
-                  type: resource.type,
-                  location: resource.location,
-                  resourceGroup: groupName,
-                  id: resource.id,
-                  tags: resource.tags || {},
-                  provisioningState: resource.provisioningState,
-                  createdTime: resource.createdTime
-                });
-              }
-            } catch (groupError) {
-              console.warn(`Error listing resources in group ${groupName}:`, groupError.message);
-            }
-          }
-          
-          console.log(`Found ${resources.length} total resources`);
-          
-          // Sort resources by type and name
-          resources.sort((a, b) => {
-            if (a.type === b.type) {
-              return a.name.localeCompare(b.name);
-            }
-            return a.type.localeCompare(b.type);
-          });
-          
-          azureData = {
-            type: 'resources',
-            data: resources,
-            count: resources.length,
-            resourceGroups: resourceGroups.length
-          };
-        } catch (resourceError) {
-          console.error('Error listing resources:', resourceError);
-          azureData = {
-            type: 'resources',
-            data: [],
-            count: 0,
-            error: resourceError.message
-          };
-        }
-      }
-      
-      // Cost data
-      else if (userMessage.includes('spending') || userMessage.includes('cost')) {
-        const scope = `/subscriptions/${process.env.AZURE_SUBSCRIPTION_ID}`;
-        const costData = await getResourceCosts(scope);
-        
-        azureData = {
-          type: 'costs',
-          data: {
-            total: costData.totalCost.toFixed(2),
-            projected: costData.projectedCost.toFixed(2),
-            byService: costData.rows.map(row => ({
-              name: row[0],
-              cost: row[1].toFixed(2),
-              percentage: costData.totalCost > 0 ? ((row[1] / costData.totalCost) * 100).toFixed(1) : "0"
-            }))
-          },
-          error: costData.error
-        };
-      }
-      
-      // CPU/Usage data
-      else if (userMessage.includes('cpu') || userMessage.includes('usage')) {
-        const resourceGroups = [];
-        for await (const group of resourceClient.resourceGroups.list()) {
-          resourceGroups.push(group.name);
-        }
-        
-        const vmsPromises = resourceGroups.map(group => 
-          computeClient.virtualMachines.list(group).catch(err => {
-            console.warn(`Error listing VMs in group ${group}:`, err.message);
-            return [];
-          })
+    // Detect intent from the last user message
+    const lastUserMessage = messages[messages.length - 1].content;
+    const intent = detectIntent(lastUserMessage);
+    const refinedPrompt = refinePrompt(lastUserMessage, intent);
+
+    // Record request metrics
+    recordMetric('request_received', 1, {
+      correlationId,
+      intent,
+      messageCount: messages.length
+    });
+
+    // Get Azure data based on intent
+    let azureData = null;
+    if (intent !== INTENTS.UNKNOWN) {
+      azureData = await trackApiCall('azure', 'get_data', async () => {
+        const azureDataPromise = getAzureData(intent);
+        const azureTimeout = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Azure data timeout')), 15000)
         );
-        
-        const vmLists = await Promise.all(vmsPromises);
-        const allVMs = vmLists.flat().filter(vm => vm && vm.id);
-        
-        if (allVMs.length === 0) {
-          azureData = {
-            type: 'metrics',
-            data: [],
-            message: 'No virtual machines found'
-          };
-        } else {
-          const timespan = 'PT24H';
-          const metricsPromises = allVMs.map(vm => 
-            getResourceMetrics(
-              { 
-                id: vm.id, 
-                name: vm.name, 
-                type: 'Microsoft.Compute/virtualMachines' 
-              }, 
-              timespan
-            ).catch(err => {
-              console.warn(`Error fetching metrics for ${vm.name}:`, err.message);
-              return null;
-            })
-          );
-          
-          const metricsResults = await Promise.all(metricsPromises);
-          const validMetrics = metricsResults.filter(m => m !== null);
-          
-          azureData = {
-            type: 'metrics',
-            data: validMetrics,
-            count: validMetrics.length
-          };
-        }
-      }
-      
-    } catch (dataError) {
-      console.error('Error fetching Azure data:', dataError);
-      errorDetails = dataError.message;
+        return Promise.race([azureDataPromise, azureTimeout]);
+      });
     }
 
-    // Always return a valid response structure
+    // Process with OpenAI
+    const openaiResponse = await trackApiCall('openai', 'completion', async () => {
+      const makeRequest = () => processWithOpenAI(lastUserMessage, messages, azureData);
+      return callWithRetry(makeRequest);
+    });
+
+    // Record completion metrics
+    recordMetric('request_completed', 1, {
+      correlationId,
+      duration: Date.now() - startTime,
+      intent,
+      hasAzureData: !!azureData
+    });
+
+    // Check if response requires approval
+    const requiresApproval = checkIfRequiresApproval(openaiResponse, intent);
+    const action = requiresApproval ? extractAction(openaiResponse, intent) : null;
+
     return res.status(200).json({
-      message: messages[messages.length - 1].content,
-      azureData: azureData || { 
-        type: 'error',
-        error: true, 
-        message: errorDetails || 'No data available'
+      message: openaiResponse,
+      azureData,
+      intent,
+      requiresApproval,
+      action,
+      correlationId,
+      metrics: {
+        duration: Date.now() - startTime,
+        intent
       }
     });
 
   } catch (error) {
-    console.error('Handler error:', error);
-    return res.status(500).json({ 
-      message: 'Error processing request',
-      error: error.message,
-      azureData: {
-        type: 'error',
-        error: true,
-        message: error.message
-      }
+    // Record error metrics
+    recordMetric('request_error', 1, {
+      correlationId,
+      errorType: error.type || 'UNKNOWN',
+      duration: Date.now() - startTime
     });
+
+    console.error('API error:', {
+      correlationId,
+      message: error.message,
+      type: error.type || 'UNKNOWN',
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    });
+
+    const statusCode = 
+      error.type === 'AZURE_AUTH_ERROR' ? 401 :
+      error.type === 'AZURE_RATE_LIMIT' ? 429 :
+      error.type === 'AZURE_RESOURCE_NOT_FOUND' ? 404 :
+      error.type === 'AZURE_INVALID_REQUEST' ? 400 : 500;
+
+    return res.status(statusCode).json({ 
+      error: 'Error processing request',
+      type: error.type || 'UNKNOWN',
+      details: error.message,
+      retryable: statusCode === 429 || statusCode === 500,
+      correlationId
+    });
+  }
+}
+
+function checkIfRequiresApproval(response, intent) {
+  const approvalKeywords = [
+    'scale', 'restart', 'stop', 'start', 'delete',
+    'update', 'modify', 'change', 'remove', 'create'
+  ];
+
+  return approvalKeywords.some(keyword => 
+    response.toLowerCase().includes(keyword)
+  );
+}
+
+function extractAction(response, intent) {
+  // Extract action details from the response based on intent
+  // This is a simplified version - you'll want to make this more robust
+  const action = {
+    type: intent,
+    resource: null,
+    details: {}
+  };
+
+  // Extract resource name if present
+  const resourceMatch = response.match(/resource ["'](.+?)["']/i);
+  if (resourceMatch) {
+    action.resource = resourceMatch[1];
+  }
+
+  return action;
+}
+
+async function handleAction(action) {
+  // Implement action handling logic here
+  // This should integrate with your Azure management APIs
+  
+  try {
+    // Example implementation
+    switch (action.type) {
+      case 'scale':
+        // Handle scaling
+        break;
+      case 'restart':
+        // Handle restart
+        break;
+      default:
+        throw new Error('Unsupported action type');
+    }
+
+    return {
+      success: true,
+      message: `Successfully executed ${action.type} operation`,
+      details: action
+    };
+
+  } catch (error) {
+    console.error('Action handling error:', error);
+    return {
+      success: false,
+      error: error.message,
+      details: action
+    };
   }
 } 
